@@ -1,0 +1,2 @@
+yt-dlp>=2024.0
+customtkinter>=5.2
