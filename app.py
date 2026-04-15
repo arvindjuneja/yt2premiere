@@ -2,9 +2,11 @@
 """YT → Premiere — Download YouTube clips as Premiere Pro-ready MP4s."""
 
 import os
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -15,6 +17,14 @@ import yt_dlp
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+IS_WINDOWS = platform.system() == "Windows"
+MONO_FONT = "Consolas" if IS_WINDOWS else "Menlo"
+
+# Hide console windows when spawning ffmpeg/ffprobe on Windows
+_SP_KWARGS: dict = {}
+if IS_WINDOWS:
+    _SP_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
 
 DEFAULT_OUTPUT_DIR = str(Path.home() / "Downloads")
 
@@ -81,7 +91,7 @@ class App(ctk.CTk):
 
         self.url_entry = ctk.CTkEntry(
             url_frame, placeholder_text="https://www.youtube.com/watch?v=…",
-            height=42, font=ctk.CTkFont(family="Menlo", size=13),
+            height=42, font=ctk.CTkFont(family=MONO_FONT, size=13),
             corner_radius=8,
         )
         self.url_entry.grid(row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14))
@@ -130,7 +140,7 @@ class App(ctk.CTk):
 
         self.dir_label = ctk.CTkLabel(
             dir_inner, text=self._short_path(self.output_dir),
-            font=ctk.CTkFont(family="Menlo", size=12),
+            font=ctk.CTkFont(family=MONO_FONT, size=12),
             text_color=("gray30", "gray70"),
         )
         self.dir_label.pack(side="left", padx=(0, 10))
@@ -250,13 +260,13 @@ class App(ctk.CTk):
                 [ffprobe, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=codec_name",
                  "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, **_SP_KWARGS,
             )
             ar = subprocess.run(
                 [ffprobe, "-v", "error", "-select_streams", "a:0",
                  "-show_entries", "stream=codec_name",
                  "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, **_SP_KWARGS,
             )
             return (vr.stdout.strip().lower(), ar.stdout.strip().lower())
         except Exception:
@@ -289,7 +299,7 @@ class App(ctk.CTk):
             cmd += ["-preset", "medium", "-crf", "20"]
         cmd.append(out_path)
 
-        subprocess.run(cmd, capture_output=True, timeout=600)
+        subprocess.run(cmd, capture_output=True, timeout=600, **_SP_KWARGS)
 
         if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
             os.remove(filepath)
