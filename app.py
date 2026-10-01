@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -69,13 +70,25 @@ QUALITY_OPTIONS = [
 
 AUDIO_ONLY = "Audio only (MP3)"
 
-QUALITY_FORMATS = {
-    "Best available (up to 4K)": "bestvideo+bestaudio/best",
-    "1080p Full HD":             "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    "720p HD":                   "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-    "480p SD":                   "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-    "Audio only (MP3)":          "bestaudio/best",
+QUALITY_HEIGHTS = {
+    "Best available (up to 4K)": None,
+    "1080p Full HD": 1080,
+    "720p HD": 720,
+    "480p SD": 480,
 }
+
+URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/\S+",
+    re.IGNORECASE,
+)
+
+# YouTube needs a JS runtime to hand out working stream URLs. Without one yt-dlp
+# falls back to a client that 403s on some videos and throttles the rest.
+JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
+
+
+def detect_js_runtimes() -> dict:
+    return {name: {} for name in JS_RUNTIMES if shutil.which(name)}
 
 
 class _Tooltip:
@@ -119,8 +132,8 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("YT → Premiere")
-        self.geometry("700x600")
-        self.minsize(600, 560)
+        self.geometry("720x860")
+        self.minsize(640, 760)
 
         icon_path = os.path.join(_resource_dir(), "assets", "icon.ico")
         if IS_WINDOWS and os.path.isfile(icon_path):
@@ -133,14 +146,32 @@ class App(ctk.CTk):
         self.downloading = False
         self.cancel_requested = False
         self._proc = None  # currently running ffmpeg process, if any
+        self.queue_index = 0
+        self.queue_total = 0
+        self.current_title = ""
+        self.js_runtimes = detect_js_runtimes()
 
         self._build_ui()
 
-        # Start ready to type, and let Enter trigger a download.
-        self.after(100, self.url_entry.focus_set)
+        # Start ready to type; Cmd/Ctrl+Enter starts the queue.
+        self.after(100, self.url_box.focus_set)
+
+        if not self.js_runtimes:
+            self._set_status(
+                "No JavaScript runtime found — downloads may fail or crawl. "
+                f"Install one with: {'winget install DenoLand.Deno' if IS_WINDOWS else 'brew install deno'}"
+            )
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        ghost = dict(
+            corner_radius=8, fg_color="transparent",
+            border_width=1, border_color=("gray70", "gray30"),
+            hover_color=("gray85", "gray25"),
+            text_color=("gray30", "gray70"),
+        )
 
         # ── Header ───────────────────────────────────────────────────────
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -153,39 +184,56 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             header,
-            text="Paste a YouTube link, pick quality, and get a Premiere Pro-ready MP4 (H.264 + AAC).",
+            text="Paste one or many YouTube links, pick quality, and get Premiere Pro-ready MP4s (H.264 + AAC).",
             font=ctk.CTkFont(size=13),
             text_color=MUTED,
-            wraplength=600, justify="left",
+            wraplength=620, justify="left",
         ).pack(anchor="w", pady=(4, 0))
 
-        # ── URL ──────────────────────────────────────────────────────────
+        # ── URLs ─────────────────────────────────────────────────────────
         url_frame = ctk.CTkFrame(self, corner_radius=12)
-        url_frame.grid(row=1, column=0, sticky="ew", padx=32, pady=(20, 0))
+        url_frame.grid(row=1, column=0, sticky="nsew", padx=32, pady=(20, 0))
         url_frame.grid_columnconfigure(0, weight=1)
+        url_frame.grid_rowconfigure(1, weight=1)
+
+        url_head = ctk.CTkFrame(url_frame, fg_color="transparent")
+        url_head.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+        url_head.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            url_frame, text="YOUTUBE URL",
+            url_head, text="YOUTUBE URLS  ·  ONE PER LINE",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=MUTED,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 4))
+        ).grid(row=0, column=0, sticky="w")
 
-        self.url_entry = ctk.CTkEntry(
-            url_frame, placeholder_text="https://www.youtube.com/watch?v=…",
-            height=42, font=ctk.CTkFont(family=MONO_FONT, size=13),
+        self.count_label = ctk.CTkLabel(
+            url_head, text="no links yet",
+            font=ctk.CTkFont(size=11), text_color=MUTED,
+        )
+        self.count_label.grid(row=0, column=1, sticky="e")
+
+        self.url_box = ctk.CTkTextbox(
+            url_frame, height=140, wrap="none",
+            font=ctk.CTkFont(family=MONO_FONT, size=12),
             corner_radius=8,
         )
-        self.url_entry.grid(row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14))
-        self.url_entry.bind("<Return>", lambda _e: self._start_download())
+        self.url_box.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
+        self.url_box.bind("<KeyRelease>", lambda _e: self._refresh_count())
+        for seq in ("<Command-Return>", "<Control-Return>"):
+            self.url_box.bind(seq, lambda _e: (self._start_download(), "break")[1])
+
+        btn_row = ctk.CTkFrame(url_frame, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 14))
 
         ctk.CTkButton(
-            url_frame, text="Paste", width=70, height=42,
-            corner_radius=8, fg_color="transparent",
-            border_width=1, border_color=("gray70", "gray30"),
-            hover_color=("gray85", "gray25"),
-            text_color=("gray30", "gray70"),
-            command=self._paste_url,
-        ).grid(row=1, column=1, sticky="e", padx=(0, 16), pady=(0, 14))
+            btn_row, text="Paste", width=80, height=34,
+            command=self._paste_urls, **ghost,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_row, text="Clear", width=80, height=34,
+            command=self._clear_urls, **ghost,
+        ).pack(side="left")
 
         # ── Options ──────────────────────────────────────────────────────
         opt_frame = ctk.CTkFrame(self, corner_radius=12)
@@ -203,7 +251,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13),
         ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 10))
 
-        self.quality_var = ctk.StringVar(value=QUALITY_OPTIONS[0])
+        self.quality_var = ctk.StringVar(value="1080p Full HD")
         self.quality_menu = ctk.CTkOptionMenu(
             opt_frame, variable=self.quality_var, values=QUALITY_OPTIONS,
             width=240, height=36, corner_radius=8,
@@ -212,13 +260,22 @@ class App(ctk.CTk):
         )
         self.quality_menu.grid(row=1, column=1, sticky="e", padx=16, pady=(0, 10))
 
+        self.prefer_h264_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            opt_frame,
+            text="Prefer YouTube's H.264 streams — no re-encoding, far faster (max 1080p)",
+            variable=self.prefer_h264_var,
+            font=ctk.CTkFont(size=12),
+            checkbox_width=20, checkbox_height=20, corner_radius=5,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 12))
+
         ctk.CTkLabel(
             opt_frame, text="Save to",
             font=ctk.CTkFont(size=13),
-        ).grid(row=2, column=0, sticky="w", padx=16, pady=(0, 10))
+        ).grid(row=3, column=0, sticky="w", padx=16, pady=(0, 10))
 
         dir_inner = ctk.CTkFrame(opt_frame, fg_color="transparent")
-        dir_inner.grid(row=2, column=1, sticky="e", padx=16, pady=(0, 10))
+        dir_inner.grid(row=3, column=1, sticky="e", padx=16, pady=(0, 10))
 
         self.dir_label = ctk.CTkLabel(
             dir_inner, text=self._short_path(self.output_dir),
@@ -230,17 +287,13 @@ class App(ctk.CTk):
 
         ctk.CTkButton(
             dir_inner, text="Browse…", width=80, height=32,
-            corner_radius=8, fg_color="transparent",
-            border_width=1, border_color=("gray70", "gray30"),
-            hover_color=("gray85", "gray25"),
-            text_color=("gray30", "gray70"),
-            command=self._browse_dir,
+            command=self._browse_dir, **ghost,
         ).pack(side="left")
 
         ctk.CTkLabel(
             opt_frame, text="Appearance",
             font=ctk.CTkFont(size=13),
-        ).grid(row=3, column=0, sticky="w", padx=16, pady=(0, 14))
+        ).grid(row=4, column=0, sticky="w", padx=16, pady=(0, 14))
 
         self.appearance_seg = ctk.CTkSegmentedButton(
             opt_frame, values=["Light", "Dark"],
@@ -248,7 +301,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=12),
         )
         self.appearance_seg.set("Dark")
-        self.appearance_seg.grid(row=3, column=1, sticky="e", padx=16, pady=(0, 14))
+        self.appearance_seg.grid(row=4, column=1, sticky="e", padx=16, pady=(0, 14))
 
         # ── Progress ─────────────────────────────────────────────────────
         prog_frame = ctk.CTkFrame(self, corner_radius=12)
@@ -261,18 +314,26 @@ class App(ctk.CTk):
             text_color=MUTED,
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 6))
 
-        self.progress_bar = ctk.CTkProgressBar(
-            prog_frame, height=10, corner_radius=5,
+        self.queue_bar = ctk.CTkProgressBar(prog_frame, height=10, corner_radius=5)
+        self.queue_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
+        self.queue_bar.set(0)
+
+        self.queue_label = ctk.CTkLabel(
+            prog_frame, text="Ready",
+            font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.progress_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 4))
+        self.queue_label.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 10))
+
+        self.progress_bar = ctk.CTkProgressBar(prog_frame, height=6, corner_radius=3)
+        self.progress_bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 4))
         self.progress_bar.set(0)
 
         self.status_label = ctk.CTkLabel(
-            prog_frame, text="Ready",
-            font=ctk.CTkFont(size=12),
-            text_color=MUTED,
+            prog_frame, text="Paste your links above to begin",
+            font=ctk.CTkFont(size=12), text_color=MUTED,
+            wraplength=620, justify="left",
         )
-        self.status_label.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 14))
+        self.status_label.grid(row=4, column=0, sticky="w", padx=16, pady=(0, 14))
 
         # ── Download button ──────────────────────────────────────────────
         self.download_btn = ctk.CTkButton(
@@ -293,8 +354,15 @@ class App(ctk.CTk):
             disp = disp[:18] + "…" + disp[-19:]
         return disp
 
+    def _ui(self, fn, *args):
+        """Schedule a UI update on the Tk main thread."""
+        self.after(0, fn, *args)
+
     def _set_status(self, text: str):
         self.status_label.configure(text=text)
+
+    def _set_queue_label(self, text: str):
+        self.queue_label.configure(text=text)
 
     def _set_appearance(self, choice: str):
         ctk.set_appearance_mode(choice.lower())
@@ -334,7 +402,7 @@ class App(ctk.CTk):
     @staticmethod
     def _humanize_error(msg: str) -> str:
         low = msg.lower()
-        if "video unavailable" in low or "not available" in low:
+        if "unavailable" in low or "not available" in low:
             return ("This video is unavailable — it may be private, deleted, "
                     "age-restricted, or blocked in your region.")
         if "sign in" in low or "confirm you" in low or "bot" in low:
@@ -348,6 +416,10 @@ class App(ctk.CTk):
             return "ffmpeg was not found. Please install ffmpeg and try again."
         if "http error 429" in low or "too many requests" in low:
             return "Too many requests to YouTube. Please wait a bit and try again."
+        if "http error 403" in low or "forbidden" in low:
+            return ("YouTube refused the download. This usually means no JavaScript "
+                    "runtime is installed (install deno) or yt-dlp is out of date "
+                    "(pip install --upgrade yt-dlp).")
         if ("getaddrinfo" in low or "failed to resolve" in low
                 or "connection" in low or "timed out" in low or "urlopen" in low):
             return "Network problem — check your internet connection and try again."
@@ -357,6 +429,29 @@ class App(ctk.CTk):
             clean = clean[:200] + "…"
         return clean or "Something went wrong. Please try again."
 
+    def _collect_urls(self) -> list[str]:
+        """Pull every YouTube link out of the box, in order, without duplicates."""
+        raw = self.url_box.get("1.0", "end")
+        seen, urls = set(), []
+        for match in URL_RE.findall(raw):
+            url = match.rstrip(".,;)]}\"'")
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
+    def _refresh_count(self):
+        n = len(self._collect_urls())
+        self.count_label.configure(
+            text="no links yet" if n == 0 else f"{n} link{'s' if n != 1 else ''} detected"
+        )
+
+    def _label(self) -> str:
+        title = self.current_title or "…"
+        if len(title) > 70:
+            title = title[:67] + "…"
+        return f"[{self.queue_index}/{self.queue_total}] {title}"
+
     # ── Actions ───────────────────────────────────────────────────────────
 
     def _browse_dir(self):
@@ -365,38 +460,52 @@ class App(ctk.CTk):
             self.output_dir = chosen
             self.dir_label.configure(text=self._short_path(chosen))
 
-    def _paste_url(self):
+    def _paste_urls(self):
         try:
             clipboard = self.clipboard_get()
-            if clipboard:
-                self.url_entry.delete(0, "end")
-                self.url_entry.insert(0, clipboard.strip())
         except Exception:
-            pass
+            return
+        if not clipboard.strip():
+            return
+        existing = self.url_box.get("1.0", "end").strip()
+        self.url_box.insert("end", ("\n" if existing else "") + clipboard.strip())
+        self._refresh_count()
 
-    def _validate_url(self, url: str) -> bool:
-        pattern = r"(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+"
-        return bool(re.match(pattern, url.strip()))
+    def _clear_urls(self):
+        self.url_box.delete("1.0", "end")
+        self._refresh_count()
 
     def _start_download(self):
         if self.downloading:
             return
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("No URL", "Please enter a YouTube URL.")
-            return
-        if not self._validate_url(url):
-            messagebox.showwarning("Invalid URL", "That doesn't look like a valid YouTube URL.")
+
+        urls = self._collect_urls()
+        if not urls:
+            messagebox.showwarning(
+                "No URLs", "Paste at least one YouTube link — one per line.",
+            )
             return
 
         self.downloading = True
         self.cancel_requested = False
+        self.queue_total = len(urls)
+        self.queue_index = 0
+
         self._set_button_busy()
+        self.url_box.configure(state="disabled")
         self._progress_indeterminate(False)
         self.progress_bar.set(0)
-        self._set_status("Starting download…")
+        self.queue_bar.set(0)
+        self._set_queue_label(f"0 / {len(urls)} done")
+        self._set_status("Starting…")
 
-        threading.Thread(target=self._download, args=(url,), daemon=True).start()
+        # Tk variables must be read on the main thread, so resolve the options
+        # here and hand the worker plain values.
+        threading.Thread(
+            target=self._run_queue,
+            args=(urls, self.quality_var.get(), self.prefer_h264_var.get()),
+            daemon=True,
+        ).start()
 
     def _cancel(self):
         if not self.downloading or self.cancel_requested:
@@ -414,42 +523,67 @@ class App(ctk.CTk):
     def _progress_hook(self, d: dict):
         if self.cancel_requested:
             raise _Cancelled()
+
+        title = (d.get("info_dict") or {}).get("title")
+        if title:
+            self.current_title = title
+
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0)
             if total:
-                self.progress_bar.set(downloaded / total)
-            speed = d.get("_speed_str", "")
-            eta = d.get("_eta_str", "")
-            self._set_status(f"Downloading… {speed}  ETA {eta}")
+                self._ui(self.progress_bar.set, downloaded / total)
+            speed = (d.get("_speed_str") or "").strip()
+            eta = (d.get("_eta_str") or "").strip()
+            self._ui(self._set_status, f"{self._label()}  ·  {speed}  ETA {eta}")
         elif d["status"] == "finished":
             # Download done; what follows (merge / audio extract / re-encode)
             # has no byte-level progress, so switch to an animated bar.
-            self.after(0, lambda: self._set_status("Merging & preparing…"))
-            self.after(0, lambda: self._progress_indeterminate(True))
+            self._ui(self._set_status, f"{self._label()}  ·  merging & preparing…")
+            self._ui(self._progress_indeterminate, True)
+
+    # ── Format selection ─────────────────────────────────────────────────
+
+    def _build_format(self, quality: str, prefer_h264: bool) -> str:
+        if quality == AUDIO_ONLY:
+            return "bestaudio[acodec^=mp4a]/bestaudio/best"
+
+        height = QUALITY_HEIGHTS.get(quality)
+        cap = f"[height<={height}]" if height else ""
+
+        chains = []
+        if prefer_h264:
+            # YouTube ships avc1 + mp4a next to its AV1/Opus streams; picking
+            # those turns the conversion step into a remux instead of a
+            # CPU-bound re-encode of every file.
+            chains.append(f"bestvideo[vcodec^=avc1]{cap}+bestaudio[acodec^=mp4a]")
+            chains.append(f"best[vcodec^=avc1][acodec^=mp4a]{cap}")
+        chains.append(f"bestvideo{cap}+bestaudio")
+        chains.append(f"best{cap}")
+        chains.append("best")
+        return "/".join(chains)
 
     # ── Codec detection & conversion ─────────────────────────────────────
 
     def _get_codecs(self, filepath: str) -> tuple[str, str]:
-        ffprobe = FFPROBE
         try:
             vr = subprocess.run(
-                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                [FFPROBE, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=codec_name",
                  "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-                capture_output=True, text=True, timeout=10, **_SP_KWARGS,
+                capture_output=True, text=True, timeout=30, **_SP_KWARGS,
             )
             ar = subprocess.run(
-                [ffprobe, "-v", "error", "-select_streams", "a:0",
+                [FFPROBE, "-v", "error", "-select_streams", "a:0",
                  "-show_entries", "stream=codec_name",
                  "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-                capture_output=True, text=True, timeout=10, **_SP_KWARGS,
+                capture_output=True, text=True, timeout=30, **_SP_KWARGS,
             )
             return (vr.stdout.strip().lower(), ar.stdout.strip().lower())
         except Exception:
             return ("", "")
 
-    def _ensure_compatible(self, filepath: str) -> str:
+    def _ensure_compatible(self, filepath: str, duration: float) -> str:
         vcodec, acodec = self._get_codecs(filepath)
         video_ok = vcodec in ("h264", "")
         audio_ok = acodec in ("aac", "")
@@ -462,53 +596,99 @@ class App(ctk.CTk):
 
         parts = ["video" if not video_ok else "", "audio" if not audio_ok else ""]
         label = " & ".join(p for p in parts if p)
-        self.after(0, self._set_status, f"Converting {label} for Premiere Pro…")
+        self._ui(self._set_status, f"{self._label()}  ·  converting {label} for Premiere Pro…")
 
-        ffmpeg = FFMPEG
-        cmd = [
-            ffmpeg, "-y", "-i", filepath,
-            "-c:v", "libx264" if not video_ok else "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            "-pix_fmt", "yuv420p",
-        ]
-        if not video_ok:
-            cmd += ["-preset", "medium", "-crf", "20"]
-        cmd.append(out_path)
+        cmd = [FFMPEG, "-y", "-i", filepath]
+        if video_ok:
+            cmd += ["-c:v", "copy"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                    "-pix_fmt", "yuv420p"]
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
 
-        self._run_cancellable(cmd, timeout=600)
+        # Re-encoding runs slower than real time, so scale the limit with the
+        # clip length rather than using a ceiling long videos always blow past.
+        timeout = max(900, int(duration * 10)) if duration else 3600
 
-        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
-            os.remove(filepath)
-            os.rename(out_path, filepath)
+        try:
+            self._run_cancellable(cmd, timeout=timeout)
+        except Exception:
+            if os.path.isfile(out_path):
+                os.remove(out_path)
+            raise
 
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("ffmpeg produced no output")
+
+        os.remove(filepath)
+        os.rename(out_path, filepath)
         return filepath
 
     def _run_cancellable(self, cmd: list, timeout: int = 600):
         """Run a subprocess so it can be killed when the user hits Cancel."""
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_SP_KWARGS,
-        )
-        deadline = time.time() + timeout
-        try:
-            while self._proc.poll() is None:
-                if self.cancel_requested:
-                    self._proc.terminate()
-                    raise _Cancelled()
-                if time.time() > deadline:
-                    self._proc.terminate()
-                    raise TimeoutError("Conversion timed out.")
-                time.sleep(0.2)
-        finally:
-            self._proc = None
+        # stderr goes to a file rather than a pipe: ffmpeg is chatty enough to
+        # fill a pipe buffer and deadlock while we poll.
+        with tempfile.TemporaryFile() as errfile:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=errfile, **_SP_KWARGS,
+            )
+            deadline = time.time() + timeout
+            try:
+                while self._proc.poll() is None:
+                    if self.cancel_requested:
+                        self._proc.terminate()
+                        raise _Cancelled()
+                    if time.time() > deadline:
+                        self._proc.terminate()
+                        raise TimeoutError("Conversion timed out.")
+                    time.sleep(0.2)
+                if self._proc.returncode != 0:
+                    errfile.seek(0)
+                    lines = errfile.read().decode("utf-8", "replace").strip().splitlines()
+                    raise RuntimeError(
+                        "ffmpeg failed: " + (lines[-1] if lines else "unknown error")
+                    )
+            finally:
+                self._proc = None
 
     # ── Download ─────────────────────────────────────────────────────────
 
-    def _download(self, url: str):
-        quality_key = self.quality_var.get()
-        fmt = QUALITY_FORMATS[quality_key]
-        is_audio = quality_key == AUDIO_ONLY
+    def _run_queue(self, urls: list, quality: str, prefer_h264: bool):
+        fmt = self._build_format(quality, prefer_h264)
+        is_audio = quality == AUDIO_ONLY
 
+        done, failures, cancelled = 0, [], False
+
+        for idx, url in enumerate(urls, start=1):
+            if self.cancel_requested:
+                cancelled = True
+                break
+
+            self.queue_index = idx
+            self.current_title = ""
+            self._ui(self._progress_indeterminate, False)
+            self._ui(self.progress_bar.set, 0)
+            self._ui(self._set_status, f"[{idx}/{len(urls)}] fetching video info…")
+
+            try:
+                self._download_one(url, fmt, is_audio)
+                done += 1
+            except _Cancelled:
+                cancelled = True
+                break
+            except Exception as exc:
+                # A cancel during the download surfaces wrapped in DownloadError.
+                if self.cancel_requested:
+                    cancelled = True
+                    break
+                failures.append((url, self._humanize_error(str(exc))))
+
+            self._ui(self.queue_bar.set, idx / len(urls))
+            self._ui(self._set_queue_label, f"{done} / {len(urls)} done")
+
+        self._ui(self._on_queue_done, done, failures, cancelled, len(urls), is_audio)
+
+    def _download_one(self, url: str, fmt: str, is_audio: bool):
         outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
 
         ydl_opts: dict = {
@@ -517,7 +697,15 @@ class App(ctk.CTk):
             "progress_hooks": [self._progress_hook],
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
+            "noplaylist": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 3,
         }
+
+        if self.js_runtimes:
+            ydl_opts["js_runtimes"] = self.js_runtimes
 
         if os.path.isdir(FFMPEG_DIR):
             ydl_opts["ffmpeg_location"] = FFMPEG_DIR
@@ -533,57 +721,69 @@ class App(ctk.CTk):
         else:
             ydl_opts["merge_output_format"] = "mp4"
 
-        try:
-            downloaded_file = None
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if info:
-                    downloaded_file = ydl.prepare_filename(info)
-                    base, _ = os.path.splitext(downloaded_file)
-                    mp4_path = base + ".mp4"
-                    if os.path.isfile(mp4_path):
-                        downloaded_file = mp4_path
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
 
-            if not is_audio and downloaded_file and os.path.isfile(downloaded_file):
-                self._ensure_compatible(downloaded_file)
+            if not info:
+                raise RuntimeError("no video information returned")
+            if "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    raise RuntimeError("nothing to download at this URL")
+                info = entries[0]
 
-            self.after(0, lambda: self._on_success(is_audio))
-        except _Cancelled:
-            self.after(0, self._on_cancelled)
-        except Exception as exc:
-            self.after(0, self._on_error, str(exc))
+            if info.get("title"):
+                self.current_title = info["title"]
 
-    def _on_success(self, is_audio: bool):
-        self.downloading = False
-        self._progress_indeterminate(False)
-        self._set_button_idle()
-        self.progress_bar.set(1.0)
+            if is_audio:
+                return
 
-        if is_audio:
-            self._set_status("Done — MP3 saved!")
-            body = f"MP3 audio saved to:\n{self.output_dir}"
-        else:
-            self._set_status("Done — Premiere Pro ready!")
-            body = f"Premiere Pro-ready MP4 saved to:\n{self.output_dir}"
+            path = next(
+                (d.get("filepath") for d in (info.get("requested_downloads") or [])
+                 if d.get("filepath")),
+                None,
+            )
+            if not path:
+                path = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp4"
 
-        if messagebox.askyesno("Complete", body + "\n\nOpen the folder now?"):
-            self._open_folder(self.output_dir)
+        if os.path.isfile(path):
+            self._ensure_compatible(path, info.get("duration") or 0)
 
-    def _on_cancelled(self):
+    def _on_queue_done(self, done: int, failures: list, cancelled: bool,
+                       total: int, is_audio: bool):
         self.downloading = False
         self.cancel_requested = False
         self._progress_indeterminate(False)
         self._set_button_idle()
+        self.url_box.configure(state="normal")
         self.progress_bar.set(0)
-        self._set_status("Cancelled")
+        self._set_queue_label(f"{done} / {total} done")
 
-    def _on_error(self, msg: str):
-        self.downloading = False
-        self._progress_indeterminate(False)
-        self._set_button_idle()
-        self.progress_bar.set(0)
-        self._set_status("Error")
-        messagebox.showerror("Download Error", self._humanize_error(msg))
+        kind = "MP3" if is_audio else "Premiere Pro-ready MP4"
+
+        if cancelled:
+            self._set_status(f"Cancelled — {done} of {total} finished")
+            messagebox.showinfo("Cancelled", f"Stopped after {done} of {total} downloads.")
+            return
+
+        if failures:
+            self._set_status(f"{done} of {total} succeeded · {len(failures)} failed")
+            preview = "\n\n".join(f"{u}\n{err}" for u, err in failures[:5])
+            if len(failures) > 5:
+                preview += f"\n\n…and {len(failures) - 5} more."
+            messagebox.showwarning(
+                "Finished with errors",
+                f"Saved {done} of {total} to:\n{self.output_dir}\n\n"
+                f"Failed ({len(failures)}):\n\n{preview}",
+            )
+            return
+
+        self.queue_bar.set(1.0)
+        self._set_status(f"Done — {done} file{'s' if done != 1 else ''} ready!")
+        body = (f"{done} {kind} file{'s' if done != 1 else ''} saved to:\n"
+                f"{self.output_dir}")
+        if messagebox.askyesno("Complete", body + "\n\nOpen the folder now?"):
+            self._open_folder(self.output_dir)
 
 
 if __name__ == "__main__":
